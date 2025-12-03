@@ -107,19 +107,63 @@ ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
    - **Location**: `ggml/src/ggml-cann/ggml-cann.cpp:1395`
    - Uses `ACL_MEM_MALLOC_HUGE_FIRST` flag for huge page allocation
 
-### CANN Pool Allocator (Alternative Path)
+## Pooling Mechanisms vs Direct Allocation
 
-CANN also has a pool-based allocator for temporary buffers:
+**Important Distinction**: The codebase has two different allocation paths:
 
-**Location**: `ggml/src/ggml-cann/ggml-cann.cpp:354`
+### 1. Main Tensor Buffer Allocation (NO POOLING)
 
-The pool allocator (`ggml_cann_pool_buf::alloc()`) also calls `aclrtMalloc()`:
-```cpp
-ggml_cann_set_device(device);
-ACL_CHECK(aclrtMalloc(&ptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
-```
+The main buffer allocation API (`ggml_backend_buft_alloc_buffer()`) **directly calls** the device allocators without any pooling:
 
-This is used internally for temporary buffers during operations (see `ggml/src/ggml-cann/aclnn_ops.cpp`).
+- **CUDA**: `ggml_backend_cuda_buffer_type_alloc_buffer()` → `ggml_cuda_device_malloc()` → `cudaMalloc()` / `cudaMallocManaged()`
+- **CANN**: `ggml_backend_cann_buffer_type_alloc_buffer()` → `aclrtMalloc()`
+
+These are used for persistent tensor buffers that hold model weights and activations.
+
+### 2. Temporary/Scratch Buffer Allocation (WITH POOLING)
+
+Both backends have **separate pooling mechanisms** for temporary buffers used during operations:
+
+#### CUDA Pool (`ggml_cuda_pool`)
+
+**Location**: `ggml/src/ggml-cuda/common.cuh:879-928`
+
+- **Types**: 
+  - `ggml_cuda_pool_leg`: Legacy buffer pool (fixed-size array)
+  - `ggml_cuda_pool_vmm`: Virtual memory pool (up to 32GB, uses `cuMemAddressReserve`/`cuMemMap`)
+- **Usage**: Temporary buffers during operations (e.g., `ggml_cuda_pool_alloc<float>`)
+- **Examples**: Used in operations like argsort, sum, matrix multiplication, etc.
+- **Location**: `ggml/src/ggml-cuda/ggml-cuda.cu:316-530`
+
+The pool ultimately calls `cudaMalloc()` when allocating new buffers, but reuses freed buffers to avoid repeated allocations.
+
+#### CANN Pool (`ggml_cann_pool`)
+
+**Location**: `ggml/src/ggml-cann/common.h:113-138`
+
+- **Types**:
+  - `ggml_cann_pool_buf`: Buffer pool with fixed-size array (MAX_BUFFERS = 256)
+  - `ggml_cann_pool_buf_prio`: Priority queue-based buffer pool
+  - `ggml_cann_pool_vmm`: Virtual memory pool (up to 32GB)
+- **Usage**: Temporary buffers during operations (e.g., `ggml_cann_pool_alloc<float>`)
+- **Examples**: Used extensively in `ggml/src/ggml-cann/aclnn_ops.cpp` for temporary workspace buffers
+- **Location**: `ggml/src/ggml-cann/ggml-cann.cpp:204-780`
+
+The pool ultimately calls `aclrtMalloc()` when allocating new buffers (line 354), but implements reuse strategies:
+- Reuses buffers of similar size
+- Cleans up old buffers based on time thresholds
+- Supports virtual memory mapping for large allocations
+
+**Pool Selection**:
+- Controlled by `GGML_CANN_MEM_POOL` environment variable: `"prio"`, `"leg"`, or `"vmm"` (default)
+- VMM pool is preferred if device supports virtual memory
+
+### Summary Table
+
+| Allocation Type | CUDA | CANN | Uses Pool? |
+|----------------|------|------|------------|
+| **Main tensor buffers** (`ggml_backend_buft_alloc_buffer`) | Direct `cudaMalloc()` | Direct `aclrtMalloc()` | ❌ No |
+| **Temporary/scratch buffers** (`ctx.pool()`) | `ggml_cuda_pool` → `cudaMalloc()` | `ggml_cann_pool` → `aclrtMalloc()` | ✅ Yes |
 
 ## Key Files
 
@@ -241,6 +285,55 @@ ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(
     
     GGML_ASSERT(buft);
     return buft->iface.alloc_buffer(buft, size);  // ← Calls backend-specific allocator
+}
+```
+
+### CUDA Pool Allocator Example
+
+**File**: `ggml/src/ggml-cuda/ggml-cuda.cu:316-530`
+
+CUDA pools are used for temporary buffers during operations:
+
+```c
+// Example: Using pool for temporary buffer in an operation
+ggml_cuda_pool & pool = ctx.pool();
+ggml_cuda_pool_alloc<float> temp_buffer(pool, size);
+// Use temp_buffer.get() during operation
+// Automatically freed when temp_buffer goes out of scope
+```
+
+The pool implementations:
+- **Legacy pool** (`ggml_cuda_pool_leg`): Maintains a fixed array of buffers, reuses them
+- **VMM pool** (`ggml_cuda_pool_vmm`): Uses CUDA virtual memory API for large allocations
+
+### CANN Pool Allocator Example
+
+**File**: `ggml/src/ggml-cann/ggml-cann.cpp:300-367`
+
+CANN pools are used extensively for temporary workspace buffers:
+
+```cpp
+// Example: Using pool for temporary buffer in an operation
+ggml_cann_pool_alloc<float> temp_buffer(ctx.pool(), size);
+// Use temp_buffer.get() during operation  
+// Automatically freed when temp_buffer goes out of scope
+```
+
+Pool allocation with reuse logic:
+```cpp
+void * ggml_cann_pool_buf::alloc(size_t size, size_t * actual_size) {
+    // Try to reuse existing buffers first
+    for (auto & b : free_buffers) {
+        if (b.size >= size && margin <= max_reuse_margin) {
+            *actual_size = b.size;
+            return b.ptr;  // Reuse existing buffer
+        }
+    }
+    
+    // If no suitable buffer found, allocate new one
+    ggml_cann_set_device(device);
+    ACL_CHECK(aclrtMalloc(&ptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
+    return ptr;
 }
 ```
 
